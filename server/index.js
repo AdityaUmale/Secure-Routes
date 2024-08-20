@@ -2,7 +2,6 @@ const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
 const { createProxyMiddleware } = require('http-proxy-middleware');
-const expressRateLimit = require('express-rate-limit');
 const ApiConfig = require('./models/ApiConfig');
 
 const app = express();
@@ -18,83 +17,115 @@ app.use(cors({
 
 app.use(express.json());
 
-// Default rate limiting middleware
-const defaultLimiter = expressRateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 100,
-  message: "Too many requests, please try again later."
-});
-const rateLimiters = new Map();
+// Simple in-memory rate limiter
+const rateLimiter = new Map();
 
+function simpleRateLimiter(limit, windowMs) {
+    return (req, res, next) => {
+        const ip = req.ip;
+        const now = Date.now();
+        const windowStart = now - windowMs;
+
+        if (!rateLimiter.has(ip)) {
+            rateLimiter.set(ip, []);
+        }
+
+        const requests = rateLimiter.get(ip);
+        const recentRequests = requests.filter(time => time > windowStart);
+
+        if (recentRequests.length >= limit) {
+            console.log(Object.keys(res));
+            console.log(typeof res.status);
+        return res.sendStatus(429);
+        }
+
+        recentRequests.push(now);
+        rateLimiter.set(ip, recentRequests);
+
+        next();
+    };
+}
 
 // Create dynamic proxy route
-function createProxyRoute(targetUrl, rateLimitValue) {
-    let customLimiter = rateLimiters.get(targetUrl);
-    
-    if (!customLimiter) {
-      customLimiter = expressRateLimit({
-        windowMs: 15 * 60 * 1000,
-        max: rateLimitValue || 100,
-        message: "Rate limit exceeded"
-      });
-      rateLimiters.set(targetUrl, customLimiter);
-    }
-  
-    return [
-      customLimiter,
-      async (req, res, next) => {
-        // Update request count in database
-        await ApiConfig.findOneAndUpdate(
-          { originalUrl: targetUrl },
-          { $inc: { requestCount: 1 } }
-        );
-        next();
-      },
-      createProxyMiddleware({
-        target: targetUrl,
-        changeOrigin: true,
-        pathRewrite: {
-          [`^/proxy/${encodeURIComponent(targetUrl)}`]: '',
-        },
-        onProxyReq: (proxyReq, req, res) => {
-          console.log(`Proxying request to: ${targetUrl}${req.url}`);
-        },
-        onProxyRes: (proxyRes, req, res) => {
-          console.log(`Received response from: ${targetUrl}${req.url}`);
-        },
-        onError: (err, req, res) => {
-          console.error('Proxy Error:', err);
-          res.status(500).send('Proxy Error');
-        }
-      })
-    ];
-  }
+function createProxyRoute(targetUrl, rateLimit) {
+    console.log("Creating proxy route for:", targetUrl);
+    const parsedUrl = new URL(targetUrl);
 
+    return [
+        simpleRateLimiter(rateLimit, 15 * 60 * 1000), // 15 minutes window
+        (req, res, next) => {
+            console.log("Proxy middleware hit:", req.method, req.url);
+            next();
+        },
+        createProxyMiddleware({
+            target: `${parsedUrl.protocol}//${parsedUrl.host}`,
+            changeOrigin: true,
+            pathRewrite: (path, req) => {
+                console.log("Original path:", path);
+                const newPath = path.replace(/^\/proxy\/[^/]+/, '');
+                console.log("Rewritten path:", newPath);
+                return newPath;
+            },
+            onProxyReq: (proxyReq, req, res) => {
+                console.log(`Proxying request to: ${parsedUrl.protocol}//${parsedUrl.host}${req.url}`);
+            },
+            onProxyRes: (proxyRes, req, res) => {
+                console.log(`Received response from: ${parsedUrl.protocol}//${parsedUrl.host}${req.url}`);
+            },
+            onError: (err, req, res) => {
+                console.error('Proxy Error:', err);
+                res.status(500).send('Proxy Error');
+            }
+        })
+    ];
+}
+
+// Middleware to update request count
+app.use('/proxy', async (req, res, next) => {
+    console.log("Request count middleware hit:", req.method, req.url);
+    const path = req.url.split('/')[1];  // Get the hostname part
+    const config = await ApiConfig.findOne({ 'proxyUrl': { $regex: path } });
+    if (config) {
+        await ApiConfig.findByIdAndUpdate(config._id, { $inc: { requestCount: 1 } });
+    }
+    next();
+});
 
 // API to create new proxy
 app.post('/api/create-proxy', async (req, res) => {
-    const { targetUrl, rateLimit } = req.body;
+    let { targetUrl, rateLimit } = req.body;
     if (!targetUrl) {
-      return res.status(400).json({ message: 'Target URL is required' });
+        return res.status(400).json({ message: 'Target URL is required' });
     }
-  
-    const proxyPath = `/proxy/${encodeURIComponent(targetUrl)}`;
-  
-    // Check if the route already exists
-    if (!app._router.stack.some(layer => layer.regexp.test(proxyPath))) {
-      app.use(proxyPath, ...createProxyRoute(targetUrl, rateLimit));
+    
+    targetUrl = targetUrl.trim();
+    console.log("Creating proxy for:", targetUrl);
+
+    try {
+        const parsedUrl = new URL(targetUrl);
+
+        const proxyPath = `/proxy/${parsedUrl.hostname}`;
+        console.log("Proxy path:", proxyPath);
+
+        // Remove any existing route with the same path
+        app._router.stack = app._router.stack.filter(layer => !(layer.regexp && layer.regexp.test(proxyPath)));
+
+        // Create the new route
+        app.use(proxyPath, ...createProxyRoute(targetUrl, rateLimit || 100));
+
+        const newConfig = new ApiConfig({
+            originalUrl: targetUrl,
+            proxyUrl: `http://localhost:8080${proxyPath}${parsedUrl.pathname}`,
+            rateLimit: rateLimit || 100
+        });
+        await newConfig.save();
+        console.log("Proxy URL created:", newConfig.proxyUrl);
+        res.json({ proxyUrl: newConfig.proxyUrl });
+    } catch (error) {
+        console.error("Error creating proxy:", error);
+        res.status(500).json({ message: 'Error creating proxy', error: error.message });
     }
-  
-    const newConfig = new ApiConfig({
-      originalUrl: targetUrl,
-      proxyUrl: `http://localhost:8080${proxyPath}`,
-      rateLimit: rateLimit || 100
-    });
-    await newConfig.save();
-    res.json({ proxyUrl: newConfig.proxyUrl });
-  });
-
-
+});
 
 // API to get stats
 app.get('/api/stats/:id', async (req, res) => {
@@ -103,6 +134,12 @@ app.get('/api/stats/:id', async (req, res) => {
     return res.status(404).json({ message: 'Config not found' });
   }
   res.json({ requestCount: config.requestCount, rateLimit: config.rateLimit });
+});
+
+// Catch-all route for unhandled requests
+app.use((req, res, next) => {
+    console.log("Unhandled request:", req.method, req.url);
+    next();
 });
 
 const PORT = process.env.PORT || 8080;

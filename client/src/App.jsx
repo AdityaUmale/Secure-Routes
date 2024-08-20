@@ -11,16 +11,17 @@ function App() {
   const handleSubmit = async (e) => {
     e.preventDefault();
     try {
-      const response = await axios.post('http://localhost:8080/api/create-proxy', { targetUrl, rateLimit });
+      const fullTargetUrl = targetUrl.startsWith('http') ? targetUrl : `http://${targetUrl}`;
+      const response = await axios.post('http://localhost:8080/api/create-proxy', { targetUrl: fullTargetUrl, rateLimit });
       setProxyUrl(response.data.proxyUrl);
     } catch (error) {
       console.error('Error creating proxy:', error);
     }
   };
-
+  
   const getStats = async () => {
     try {
-      const id = proxyUrl.split('/').pop();
+      const id = encodeURIComponent(proxyUrl.split('/').pop());
       const response = await axios.get(`http://localhost:8080/api/stats/${id}`);
       setStats(response.data);
     } catch (error) {
