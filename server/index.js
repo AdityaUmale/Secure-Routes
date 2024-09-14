@@ -34,9 +34,7 @@ function simpleRateLimiter(limit, windowMs) {
         const recentRequests = requests.filter(time => time > windowStart);
 
         if (recentRequests.length >= limit) {
-            console.log(Object.keys(res));
-            console.log(typeof res.status);
-        return res.sendStatus(429);
+            return res.status(429).json({ message: 'Too many requests' });
         }
 
         recentRequests.push(now);
@@ -46,7 +44,7 @@ function simpleRateLimiter(limit, windowMs) {
     };
 }
 
-// Create dynamic proxy route
+// Modify the createProxyRoute function
 function createProxyRoute(targetUrl, rateLimit) {
     console.log("Creating proxy route for:", targetUrl);
     const parsedUrl = new URL(targetUrl);
@@ -74,7 +72,9 @@ function createProxyRoute(targetUrl, rateLimit) {
             },
             onError: (err, req, res) => {
                 console.error('Proxy Error:', err);
-                res.status(500).send('Proxy Error');
+                if (!res.headersSent) {
+                    res.status(500).json({ message: 'Proxy Error' });
+                }
             }
         })
     ];
@@ -107,8 +107,11 @@ app.post('/api/create-proxy', async (req, res) => {
         const proxyPath = `/proxy/${parsedUrl.hostname}`;
         console.log("Proxy path:", proxyPath);
 
-        // Remove any existing route with the same path
-        app._router.stack = app._router.stack.filter(layer => !(layer.regexp && layer.regexp.test(proxyPath)));
+        // Check if a route with this path already exists
+        const existingConfig = await ApiConfig.findOne({ proxyUrl: new RegExp(proxyPath) });
+        if (existingConfig) {
+            return res.json({ proxyUrl: existingConfig.proxyUrl, id: existingConfig._id });
+        }
 
         // Create the new route
         app.use(proxyPath, ...createProxyRoute(targetUrl, rateLimit || 100));
@@ -120,7 +123,7 @@ app.post('/api/create-proxy', async (req, res) => {
         });
         await newConfig.save();
         console.log("Proxy URL created:", newConfig.proxyUrl);
-        res.json({ proxyUrl: newConfig.proxyUrl });
+        res.json({ proxyUrl: newConfig.proxyUrl, id: newConfig._id });
     } catch (error) {
         console.error("Error creating proxy:", error);
         res.status(500).json({ message: 'Error creating proxy', error: error.message });
@@ -129,17 +132,56 @@ app.post('/api/create-proxy', async (req, res) => {
 
 // API to get stats
 app.get('/api/stats/:id', async (req, res) => {
-  const config = await ApiConfig.findById(req.params.id);
-  if (!config) {
-    return res.status(404).json({ message: 'Config not found' });
+  try {
+    const config = await ApiConfig.findById(req.params.id);
+    if (!config) {
+      return res.status(404).json({ message: 'Config not found' });
+    }
+    res.json({ requestCount: config.requestCount, rateLimit: config.rateLimit });
+  } catch (error) {
+    console.error('Error fetching stats:', error);
+    res.status(500).json({ message: 'Internal server error' });
   }
-  res.json({ requestCount: config.requestCount, rateLimit: config.rateLimit });
 });
 
 // Catch-all route for unhandled requests
 app.use((req, res, next) => {
     console.log("Unhandled request:", req.method, req.url);
     next();
+});
+
+// Add a global error handler
+app.use((err, req, res, next) => {
+    console.error('Global error handler:', err);
+    res.status(500).send('Something went wrong');
+});
+
+// API to update rate limit
+app.put('/api/update-rate-limit/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { rateLimit } = req.body;
+        const updatedProxy = await ApiConfig.findByIdAndUpdate(id, { rateLimit }, { new: true });
+        if (!updatedProxy) {
+            return res.status(404).json({ message: 'Proxy not found' });
+        }
+        res.json(updatedProxy);
+    } catch (error) {
+        console.error('Error updating rate limit:', error);
+        res.status(500).json({ message: 'Internal server error' });
+    }
+});
+
+// API to fetch all proxies
+app.get('/api/proxies', async (req, res) => {
+    try {
+        const proxies = await ApiConfig.find();
+        console.log("Proxies:", proxies);
+        res.json(proxies);
+    } catch (error) {
+        console.error('Error fetching proxies:', error);
+        res.status(500).json({ message: 'Internal server error' });
+    }
 });
 
 const PORT = process.env.PORT || 8080;
